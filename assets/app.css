@@ -47,6 +47,12 @@ a{color:var(--indigo-2)}
   *{transition:none !important;animation:none !important}
 }
 
+/* Видимый фокус. Без него человек, идущий по странице с клавиатуры, не знает,
+   где находится, а половина элементов здесь, это кликабельные строки. */
+:focus{outline:none}
+:focus-visible{outline:2px solid var(--indigo-2);outline-offset:2px;border-radius:4px}
+.c:focus-visible,.side:focus-visible{outline-offset:-2px;z-index:4}
+
 /* ── шапка ──────────────────────────────────────────────── */
 .top{
   background:linear-gradient(122deg,#1B1A6E 0%,#2E2CA6 52%,#171645 100%);
@@ -286,6 +292,9 @@ a{color:var(--indigo-2)}
 .drop{border:2px dashed var(--line-2);border-radius:var(--r-lg);background:var(--card);
   padding:30px 20px;text-align:center;transition:.15s}
 .drop.hot{border-color:var(--indigo-2);background:#F4F4FD}
+/* Подпись у кнопки длинная, а экраны бывают по 320 точек: без переноса
+   кнопка вылезает за край зоны. */
+.drop .btn{white-space:normal;max-width:100%}
 .drop .big{font-size:15px;font-weight:600;margin-bottom:4px}
 .drop .sm{font-size:12.5px;color:var(--muted);line-height:1.5;margin-bottom:14px}
 .files{display:flex;flex-direction:column;gap:5px;margin-top:14px;text-align:left}

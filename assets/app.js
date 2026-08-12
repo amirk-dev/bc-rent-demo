@@ -36,6 +36,30 @@
       .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
 
+  /* Кликабельный элемент, который не является кнопкой. Без этого строки
+     шахматки и таблиц открываются мышью, но недостижимы с клавиатуры, а
+     фокус на них не виден вовсе. */
+  function clickable(node, fn, label) {
+    node.setAttribute('role', 'button');
+    node.setAttribute('tabindex', '0');
+    if (label) node.setAttribute('aria-label', label);
+    node.onclick = fn;
+    node.onkeydown = function (e) {
+      if (e.key === 'Enter' || e.key === ' ' || e.key === 'Spacebar') {
+        e.preventDefault();
+        fn();
+      }
+    };
+    return node;
+  }
+
+  /* aria-current="false" разметку не украшает и читалкам не помогает:
+     признак либо стоит, либо его нет. */
+  function markCurrent(node, on) {
+    if (on) node.setAttribute('aria-current', 'true');
+    else node.removeAttribute('aria-current');
+  }
+
   function fmt(n) { return Math.round(n).toLocaleString('ru-RU'); }
   /* Ноль в миллионах выглядит как сломанный счётчик, поэтому показывается цифрой. */
   function mln(n) { return n < 1e5 ? fmt(n) : (n / 1e6).toFixed(2).replace('.', ',') + ' млн'; }
@@ -70,8 +94,10 @@
     filter: 'all',
     query: '',
     selected: null,
+    panelOpen: false,
     debtor: null,
     planFloor: 3,
+    lead: { name: '', phone: '', area: '' },
     auditState: 'idle',    // idle, run, done
     auditFiles: [],
     invoicesIssued: false
@@ -81,11 +107,26 @@
 
   function statusOf(r) { return r.cells[NOW].s; }
 
+  /* Занято ли помещение прямо сейчас. Наличие арендатора этого не означает:
+     у съехавшего договор в реестре остаётся, а помещение уже свободно или
+     забронировано под следующего. Пока экраны смотрели на r.tenant, шахматка
+     подписывала бронь именем прежней компании, а карточка предлагала выставить
+     ей счёт за сентябрь. */
+  function isOccupied(r) {
+    return ['paid', 'due', 'debt', 'plan'].indexOf(statusOf(r)) >= 0;
+  }
+
+  /* Долг считается по суммам, которые реально стояли в счетах тех месяцев,
+     а не по текущей ставке. Иначе применение индексации задним числом
+     раздувает старый долг, хотя счета за те месяцы выставлялись по старой
+     ставке и арендатор должен ровно их. */
   function recalc(r) {
-    var months = [];
-    r.cells.forEach(function (c, i) { if (c.s === 'debt') months.push(i); });
+    var months = [], sum = 0;
+    r.cells.forEach(function (c, i) {
+      if (c.s === 'debt') { months.push(i); sum += c.sum; }
+    });
     r.debtMonths = months;
-    r.debt = months.length * r.monthly;
+    r.debt = sum;
   }
 
   function utilities(r) {
@@ -128,9 +169,13 @@
       return r.tenant && r.tenant.contractEnd >= NOW && r.tenant.contractEnd < 12;
     }).sort(function (a, b) { return a.tenant.contractEnd - b.tenant.contractEnd; });
   }
+  /* Только действующие договоры. Индексировать ставку арендатору, который
+     съехал весной, бессмысленно, а в сумме недоначисления он даёт цифру,
+     которую невозможно взыскать. */
   function forgottenIndex() {
     return D.ROOMS.filter(function (r) {
-      return r.tenant && r.tenant.indexForgotten && !r.tenant.indexApplied;
+      return r.tenant && r.tenant.indexForgotten && !r.tenant.indexApplied &&
+        r.tenant.contractEnd >= NOW;
     });
   }
   function tenants() {
@@ -155,6 +200,21 @@
     return D.ROOMS.reduce(function (s, r) { return s + r.debt; }, 0);
   }
 
+  /* Начислено и собрано за текущий месяц берутся из сумм тех самых ячеек, а не
+     из текущей ставки: август уже закрыт, и индексация, применённая сегодня,
+     не имеет права его переписывать. */
+  function billedAt(month) {
+    return D.ROOMS.reduce(function (s, r) {
+      var c = r.cells[month];
+      return s + (['paid', 'due', 'debt', 'plan'].indexOf(c.s) >= 0 ? c.sum : 0);
+    }, 0);
+  }
+  function collectedAt(month) {
+    return D.ROOMS.reduce(function (s, r) {
+      return s + (r.cells[month].s === 'paid' ? r.cells[month].sum : 0);
+    }, 0);
+  }
+
   /* ─── действия, меняющие состояние ────────────────────── */
 
   function issueInvoices() {
@@ -166,9 +226,10 @@
         n++;
       }
     });
-    state.invoicesIssued = true;
     render();
-    toast('Демонстрация: ' + n + ' счетов за сентябрь сформировано и отправлено в WhatsApp одним действием. В шахматке сентябрь стал жёлтым.');
+    toast(n
+      ? 'Демонстрация: ' + n + ' счетов за сентябрь сформировано и отправлено в WhatsApp одним действием. В шахматке сентябрь стал жёлтым.'
+      : 'Все счета за сентябрь уже выставлены, выставлять нечего.');
   }
 
   function markPaid(r, monthIdx) {
@@ -234,14 +295,18 @@
     toast('Демонстрация: ЭСФ по помещению ' + r.id + ' выписана и ушла в ИС ЭСФ. Срок по закону, 15 календарных дней с даты оборота.');
   }
 
+  /* ЭСФ выписывается по обороту, то есть по выставленному или оплаченному
+     счёту. Проверять «не plan» нельзя: у съехавшего арендатора в сентябре
+     стоит «свободно», и он тоже прошёл бы это условие. */
   function issueEsfAll() {
     var n = 0;
     tenants().forEach(function (r) {
-      if (r.cells[NEXT].s !== 'plan' && !r.tenant.esf) { r.tenant.esf = true; n++; }
+      var s = r.cells[NEXT].s;
+      if ((s === 'due' || s === 'paid') && !r.tenant.esf) { r.tenant.esf = true; n++; }
     });
     render();
-    toast(n ? 'Демонстрация: ' + n + ' ЭСФ выписано пакетом.'
-            : 'Сначала выставьте счета: ЭСФ выписывается по обороту, а не заранее.');
+    toast(n ? 'Демонстрация: ' + n + ' ЭСФ выписано пакетом и отправлено в ИС ЭСФ.'
+            : 'Выписывать нечего: ЭСФ идёт по обороту, значит сначала счета за сентябрь.');
   }
 
   /* ─── цепочка напоминаний ─────────────────────────────── */
@@ -339,7 +404,7 @@
       var n = badgeOf(s.id);
       b.innerHTML = icon(s.ic) + '<span>' + s.name + '</span>' +
         (n ? '<span class="n">' + n + '</span>' : '');
-      b.setAttribute('aria-current', state.screen === s.id);
+      markCurrent(b, state.screen === s.id);
       b.onclick = function () { go(s.id); };
       rail.append(b);
     });
@@ -357,7 +422,7 @@
       var n = badgeOf(s.id);
       b.innerHTML = icon(s.ic, 22) + '<span>' + s.name + '</span>' +
         (n ? '<span class="n">' + n + '</span>' : '');
-      b.setAttribute('aria-current', state.screen === s.id);
+      markCurrent(b, state.screen === s.id);
       b.onclick = function () { go(s.id); };
       bar.append(b);
     });
@@ -365,7 +430,7 @@
     var rest = SCREENS.filter(function (s) { return !s.tab; });
     var restActive = rest.some(function (s) { return s.id === state.screen; });
     more.innerHTML = icon('i-more', 22) + '<span>Ещё</span>';
-    more.setAttribute('aria-current', restActive);
+    markCurrent(more, restActive);
     more.onclick = openSheet;
     bar.append(more);
   }
@@ -378,7 +443,7 @@
       var n = badgeOf(s.id);
       b.innerHTML = icon(s.ic) + '<span>' + s.name + '</span>' +
         (n ? '<span class="n">' + n + '</span>' : '');
-      b.setAttribute('aria-current', state.screen === s.id);
+      markCurrent(b, state.screen === s.id);
       b.onclick = function () { go(s.id); };
       sheet.append(b);
     });
@@ -394,14 +459,18 @@
 
   function closePanel() {
     state.selected = null;
-    $('panel').classList.remove('open');
+    state.panelOpen = false;
     render();
   }
 
-  function selectRoom(r) {
+  /* Открытость карточки, это состояние, а не класс на элементе. Класс сбивался
+     любой следующей перерисовкой, и на телефоне переход из витрины в шахматку
+     оставлял карточку за краем экрана. */
+  function selectRoom(r, screen) {
     state.selected = r.id;
-    render();
-    $('panel').classList.add('open');
+    state.panelOpen = true;
+    if (screen && screen !== state.screen) go(screen);
+    else render();
   }
 
   function renderPanel() {
@@ -418,7 +487,7 @@
       p.innerHTML = 'Выберите помещение, чтобы увидеть арендатора, договор и платежи';
       return;
     }
-    p.className = 'panel';
+    p.className = 'panel' + (state.panelOpen ? ' open' : '');
 
     var st = statusOf(r);
     var badge = {
@@ -427,7 +496,10 @@
       book: ['Бронь', 'b-book'], fix: ['Ремонт', 'b-fix'], plan: ['По договору', 'b-paid']
     }[st];
 
-    var t = r.tenant;
+    /* Карточка показывает состояние помещения, а не наличие записи в реестре.
+       Прежний арендатор, если он был, идёт отдельной строкой и без действий. */
+    var t = isOccupied(r) ? r.tenant : null;
+    var past = !t && r.tenant ? r.tenant : null;
     var rows;
 
     if (t) {
@@ -454,6 +526,11 @@
         ['Потенциал', money(r.monthly) + ' в месяц'],
         ['Недополучено', '<span style="color:var(--coral)">' + money(r.monthly * r.idle) + '</span>']
       ];
+      if (past) {
+        rows.push(['Прежний арендатор', esc(past.name)]);
+        rows.push(['Договор закончился', past.contractEnd >= 0 && past.contractEnd < 12
+          ? monthName(past.contractEnd) : 'до начала периода']);
+      }
     }
 
     var pay = r.cells.map(function (c, i) {
@@ -499,7 +576,12 @@
 
     if (t) {
       if (r.debt) {
-        add('wa', 'Напомнить о долге в WhatsApp', function () { go('remind'); state.debtor = r.id; });
+        /* Должника выбираем до перехода: go() может отрисовать экран сразу,
+           и тогда на нём открылся бы не тот арендатор. */
+        add('wa', 'Напомнить о долге в WhatsApp', function () {
+          state.debtor = r.id;
+          go('remind');
+        });
         add('sec', 'Отметить оплату долга', function () { payAllDebt(r); });
       }
       if (r.cells[NEXT].s === 'plan') {
@@ -512,7 +594,10 @@
       } else if (r.cells[NEXT].s === 'due') {
         add('sec', 'Отметить оплату за сентябрь', function () { markPaid(r, NEXT); });
       }
-      if (!t.esf) add('gho', 'Выписать ЭСФ', function () { issueEsf(r); });
+      /* ЭСФ идёт по обороту: пока счёт за сентябрь не выставлен, выписывать нечего. */
+      if (!t.esf && (r.cells[NEXT].s === 'due' || r.cells[NEXT].s === 'paid')) {
+        add('gho', 'Выписать ЭСФ', function () { issueEsf(r); });
+      }
       if (t.indexForgotten && !t.indexApplied) {
         add('danger', 'Применить забытую индексацию, ' + t.indexPct + '%', function () { applyIndexation(r); });
       }
@@ -627,12 +712,13 @@
         side.innerHTML =
           '<div class="r1"><span class="dot" style="background:' + col + '"></span>' +
           '<b>' + r.id + '</b><span class="a">' + r.area + ' кв. м, ' + fmt(r.rate) + '</span></div>' +
-          '<div class="t' + (r.tenant ? '' : ' free') + '">' +
-            (r.tenant ? esc(r.tenant.name)
+          '<div class="t' + (isOccupied(r) ? '' : ' free') + '">' +
+            (isOccupied(r) ? esc(r.tenant.name)
               : st === 'book' ? 'бронь, договор готовится'
               : st === 'fix' ? 'ремонт' : 'свободно') +
           '</div>';
-        side.onclick = function () { selectRoom(r); };
+        clickable(side, function () { selectRoom(r); },
+          'Помещение ' + r.id + (r.tenant ? ', ' + r.tenant.name : ', свободно'));
         g.append(side);
 
         r.cells.forEach(function (c, i) {
@@ -765,11 +851,11 @@
         '<td class="wide" data-l="Арендатор">' + esc(r.tenant.name) + '</td>' +
         '<td data-l="Помещение">' + r.id + ', ' + r.area + ' кв. м</td>' +
         '<td data-l="Договор">№ ' + esc(r.tenant.contractNo) + '</td>' +
-        '<td class="num" data-l="Платёж">' + money(r.monthly) + '</td>' +
+        '<td class="num" data-l="Платёж">' + (isOccupied(r) ? money(r.monthly) : 'нет') + '</td>' +
         '<td class="num" data-l="Долг">' + (r.debt
           ? '<span style="color:var(--coral);font-weight:700">' + money(r.debt) + '</span>' : 'нет') + '</td>' +
         '<td data-l="Статус"><span class="badge ' + badge[1] + '">' + badge[0] + '</span></td>';
-      tr.onclick = function () { selectRoom(r); };
+      clickable(tr, function () { selectRoom(r); }, 'Карточка: ' + r.tenant.name);
       tb.append(tr);
     });
     t.append(tb);
@@ -861,7 +947,8 @@
         } else if (s === 'due') {
           markPaid(r, NEXT);
         } else {
-          selectRoom(r);
+          /* На этом экране панели нет, поэтому карточку открываем там, где она есть. */
+          selectRoom(r, 'tenants');
         }
       };
       td.append(btn);
@@ -988,7 +1075,9 @@
       var n = 0;
       list.forEach(function (r) { if (r.tenant.reminderStage < CHAIN.length) { sendNextReminderQuiet(r); n++; } });
       render();
-      toast('Демонстрация: следующий шаг цепочки отправлен ' + n + ' должникам одним действием.');
+      toast(n
+        ? 'Демонстрация: следующий шаг цепочки отправлен ' + n + ' должникам одним действием.'
+        : 'У всех должников цепочка пройдена целиком, дальше вопрос уходит юристу.');
     };
     acts.append(bp, ball);
     card.append(acts);
@@ -1048,14 +1137,20 @@
       'Сроки, индексации и каникулы в одном месте. Ответственный получает уведомление заранее, ' +
       'а не в день, когда договор закончился.'));
 
+    /* Сначала действующие договоры по близости срока, закончившиеся в конце.
+       Сортировка просто по дате ставила наверх тех, кто уже съехал, то есть
+       ровно то, чем заниматься не надо. */
     var list = tenants().slice().sort(function (a, b) {
+      var aa = isOccupied(a) ? 0 : 1, bb = isOccupied(b) ? 0 : 1;
+      if (aa !== bb) return aa - bb;
       return a.tenant.contractEnd - b.tenant.contractEnd;
     });
 
     var k = el('div', 'kpis');
     var forg = forgottenIndex();
-    var hol = list.filter(function (r) { return r.tenant.holidays > 0; });
-    [['Действующих договоров', list.length + '', 'на ' + fmt(list.reduce(function (s, r) { return s + r.area; }, 0)) + ' кв. м', ''],
+    var active = activeTenants();
+    var hol = active.filter(function (r) { return r.tenant.holidays > 0; });
+    [['Действующих договоров', active.length + '', 'на ' + fmt(active.reduce(function (s, r) { return s + r.area; }, 0)) + ' кв. м, всего в реестре ' + list.length, ''],
      ['Заканчиваются до февраля', ending().length + '', 'нужна пролонгация', 'warn'],
      ['Индексаций пропущено', forg.length + '', 'разбор на экране аудита', forg.length ? 'bad' : 'good'],
      ['С каникулами', hol.length + '', 'нулевая аренда на въезде', '']
@@ -1077,15 +1172,24 @@
     head += '</tr></thead>';
     ct.innerHTML = head;
     var ctb = el('tbody');
-    [['Окончание договора', function (r, i) { return r.tenant.contractEnd === i; }, 'var(--coral)'],
-     ['Индексация ставки', function (r, i) { return r.tenant.indexMonth === i && !r.tenant.indexApplied; }, 'var(--amber)'],
-     ['Конец каникул', function (r, i) { return r.tenant.holidays > 0 && r.tenant.holidays === i; }, 'var(--indigo-2)']
+    /* Третья строка, это то, ради чего календарь нужен: срок, когда пора
+       начинать разговор о продлении. Каникулы сюда не ставятся: в данных
+       лежит их длительность, а не месяц окончания, и вывести дату из неё
+       нельзя. Каникулы показаны в таблице ниже, там это честно. */
+    /* Окончание договора, это факт, поэтому считается по всему реестру, включая
+       закончившиеся. Индексация и пролонгация, это будущие действия, и делать
+       их по съехавшему арендатору не с кем: там только действующие. */
+    [['Окончание договора', function (r, i) { return r.tenant.contractEnd === i; }, 'var(--coral)', list],
+     ['Индексация ставки', function (r, i) { return r.tenant.indexMonth === i && !r.tenant.indexApplied; }, 'var(--amber)', active],
+     ['Начать пролонгацию, за 60 дней', function (r, i) {
+       return r.tenant.contractEnd < 12 && r.tenant.contractEnd - 2 === i && i >= 0;
+     }, 'var(--indigo-2)', active]
     ].forEach(function (row) {
       var tr = el('tr');
       var html = '<td><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:' +
         row[2] + ';margin-right:7px"></span>' + row[0] + '</td>';
       D.MONTHS.forEach(function (m, i) {
-        var n = list.filter(function (r) { return row[1](r, i); }).length;
+        var n = row[3].filter(function (r) { return row[1](r, i); }).length;
         html += '<td class="num" style="' + (n ? 'font-weight:700;color:' + row[2] : 'color:var(--muted)') +
           (i === NOW ? ';background:#F1F1FA' : '') + '">' + (n || '0') + '</td>';
       });
@@ -1423,8 +1527,7 @@
     planBox.querySelectorAll('.rm').forEach(function (g) {
       g.addEventListener('click', function () {
         var id = +g.getAttribute('data-room');
-        D.ROOMS.forEach(function (r) { if (r.id === id) selectRoom(r); });
-        go('grid');
+        D.ROOMS.forEach(function (r) { if (r.id === id) selectRoom(r, 'grid'); });
       });
     });
     pad.append(planBox);
@@ -1445,7 +1548,7 @@
         var b = el('button', 'btn pri', 'Забронировать');
         b.onclick = function () { bookRoom(r); };
         var b2 = el('button', 'btn gho', 'Посмотреть');
-        b2.onclick = function () { selectRoom(r); go('grid'); };
+        b2.onclick = function () { selectRoom(r, 'grid'); };
         o.append(b, b2);
         offers.append(o);
       });
@@ -1453,16 +1556,29 @@
     }
 
     pad.append(el('div', 'h2', 'Заявка на просмотр'));
+    /* Введённое держится в состоянии: выбор этажа перерисовывает экран целиком,
+       и без этого набранное имя пропадало на глазах у человека. */
     var form = el('div', 'form');
-    form.innerHTML =
-      '<div><label>Как вас зовут</label><input id="fName" placeholder="Имя и компания"></div>' +
-      '<div><label>Телефон или WhatsApp</label><input id="fPhone" placeholder="+7"></div>' +
-      '<div><label>Какая площадь нужна</label><input id="fArea" placeholder="например, от 60 до 90 кв. м"></div>';
+    [['name', 'Как вас зовут', 'Имя и компания'],
+     ['phone', 'Телефон или WhatsApp', '+7'],
+     ['area', 'Какая площадь нужна', 'например, от 60 до 90 кв. м']
+    ].forEach(function (f) {
+      var box = el('div', '');
+      var lab = el('label', '', f[1]);
+      var inp = el('input');
+      inp.placeholder = f[2];
+      inp.value = state.lead[f[0]];
+      inp.oninput = function (e) { state.lead[f[0]] = e.target.value; };
+      box.append(lab, inp);
+      form.append(box);
+    });
     var send = el('button', 'btn pri wide', 'Отправить заявку');
     send.onclick = function () {
-      var n = ($('fName') || {}).value || '';
+      var n = state.lead.name.trim();
       toast('Демонстрация: заявка' + (n ? ' от ' + n : '') + ' принята. ' +
         'На пилоте ответ уходит в WhatsApp за минуты, круглосуточно, а не на следующее утро.');
+      state.lead = { name: '', phone: '', area: '' };
+      render();
     };
     form.append(send);
     pad.append(form);
@@ -1479,9 +1595,8 @@
     var occ = occupied(), free = freeRooms();
     var occArea = occ.reduce(function (s, r) { return s + r.area; }, 0);
     var pct = Math.round(occArea / D.RENT_AREA * 100);
-    var billed = occ.reduce(function (s, r) { return s + r.monthly; }, 0);
-    var collected = D.ROOMS.filter(function (r) { return statusOf(r) === 'paid'; })
-      .reduce(function (s, r) { return s + r.monthly; }, 0);
+    var billed = billedAt(NOW);
+    var collected = collectedAt(NOW);
     var debts = debtors();
     var end = ending();
 
@@ -1527,9 +1642,8 @@
 
     var occ = occupied(), free = freeRooms();
     var occArea = occ.reduce(function (s, r) { return s + r.area; }, 0);
-    var billed = occ.reduce(function (s, r) { return s + r.monthly; }, 0);
-    var collected = D.ROOMS.filter(function (r) { return statusOf(r) === 'paid'; })
-      .reduce(function (s, r) { return s + r.monthly; }, 0);
+    var billed = billedAt(NOW);
+    var collected = collectedAt(NOW);
 
     var k = el('div', 'kpis');
     [['Занятость', Math.round(occArea / D.RENT_AREA * 100) + '%',
@@ -1617,7 +1731,7 @@
         '<td class="wide" data-l="Что просили">' + r[1] + '</td>' +
         '<td data-l="Где смотреть"><span class="badge b-paid">' + r[2] + '</span></td>' +
         '<td data-l="Что показывает">' + r[3] + '</td>';
-      tr.onclick = function () { go(r[4]); };
+      clickable(tr, function () { go(r[4]); }, 'Перейти: ' + r[1]);
       tb.append(tr);
     });
     t.append(tb);
@@ -1718,6 +1832,11 @@
   $('objSub').textContent = D.OBJECT.city + ', ' + D.OBJECT.floorsCount + ' этажей, ' +
     D.ROOMS.length + ' помещений, ' + fmt(D.RENT_AREA) + ' кв. м арендопригодной';
   document.title = 'Управление арендой, ' + D.OBJECT.name + ', демонстрация';
+
+  /* Долг пересчитывается тем же способом, что и после любого действия:
+     генератор считает его по количеству месяцев, и без этого первая цифра
+     на экране была бы получена иначе, чем все последующие. */
+  D.ROOMS.forEach(recalc);
 
   $('sheetBg').onclick = closeSheet;
   window.addEventListener('hashchange', route);
